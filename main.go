@@ -17,19 +17,23 @@ limitations under the License.
 package main
 
 import (
-	"flag"
-	"time"
+    "fmt"
+    "flag"
 
-	kubeinformers "k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+    appsv1 "k8s.io/api/apps/v1"
+    // corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog"
+
+    "k8s.io/client-go/informers"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/tools/cache"
+    "k8s.io/client-go/tools/clientcmd"
+	// clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
+	// "k8s.io/sample-controller/pkg/signals"
 	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
 	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions"
-	"k8s.io/sample-controller/pkg/signals"
 )
 
 var (
@@ -42,7 +46,7 @@ func main() {
 	flag.Parse()
 
 	// set up signals so we handle the first shutdown signal gracefully
-	stopCh := signals.SetupSignalHandler()
+	// stopCh := signals.SetupSignalHandler()
 
 	cfg, err := clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
@@ -54,26 +58,33 @@ func main() {
 		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
-	exampleClient, err := clientset.NewForConfig(cfg)
-	if err != nil {
-		klog.Fatalf("Error building example clientset: %s", err.Error())
-	}
+    factory := informers.NewSharedInformerFactory(kubeClient, 0)
+    deploymentsInformer := factory.Apps().V1().Deployments().Informer()
+    stopper := make(chan struct{})
+    defer close(stopper)
+    defer runtime.HandleCrash()
+    deploymentsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: onAdd,
+    })
+    go deploymentsInformer.Run(stopper)
+    if !cache.WaitForCacheSync(stopper, deploymentsInformer.HasSynced) {
+        runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+        return
+    }
+    <-stopper
+}
 
-	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
-	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
-
-	controller := NewController(kubeClient, exampleClient,
-		kubeInformerFactory.Apps().V1().Deployments(),
-		exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
-
-	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
-	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
-	kubeInformerFactory.Start(stopCh)
-	exampleInformerFactory.Start(stopCh)
-
-	if err = controller.Run(2, stopCh); err != nil {
-		klog.Fatalf("Error running controller: %s", err.Error())
-	}
+// onAdd is the function executed when the kubernetes informer notified the
+// presence of a new kubernetes node in the cluster
+func onAdd(obj interface{}) {
+    deployment := obj.(*appsv1.Deployment)
+    fmt.Println("Deployment: " + deployment.ObjectMeta.Name)
+    // Cast the obj as node
+    // node := obj.(*corev1.Node)
+    // _, ok := node.GetLabels()["label"]
+    // if ok {
+    //     fmt.Printf("It has the label!")
+    // }
 }
 
 func init() {

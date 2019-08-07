@@ -79,6 +79,10 @@ func main() {
 func onAdd(obj interface{}) {
     deployment := obj.(*appsv1.Deployment)
     fmt.Println("Deployment: " + deployment.ObjectMeta.Name)
+    for k,v := range deployment.Spec.Template.ObjectMeta.Labels {
+        fmt.Printf("Label: ")
+        fmt.Printf("key[%s] value[%s]\n", k, v)
+    }
     // Cast the obj as node
     // node := obj.(*corev1.Node)
     // _, ok := node.GetLabels()["label"]

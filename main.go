@@ -17,29 +17,26 @@ limitations under the License.
 package main
 
 import (
-    "fmt"
-    "flag"
+	"flag"
+	"fmt"
 
-    appsv1 "k8s.io/api/apps/v1"
-    // corev1 "k8s.io/api/core/v1"
-    "k8s.io/apimachinery/pkg/util/runtime"
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2b2 "k8s.io/api/autoscaling/v2beta2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
-
-    "k8s.io/client-go/informers"
-    "k8s.io/client-go/kubernetes"
-    "k8s.io/client-go/tools/cache"
-    "k8s.io/client-go/tools/clientcmd"
-	// clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	// "k8s.io/sample-controller/pkg/signals"
-	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
-	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-
 )
 
 var (
 	masterURL  string
 	kubeconfig string
 )
+
+var newHPAs = make(chan autoscalingv2b2.HorizontalPodAutoscaler)
 
 func main() {
 	klog.InitFlags(nil)
@@ -58,37 +55,95 @@ func main() {
 		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
-    factory := informers.NewSharedInformerFactory(kubeClient, 0)
-    deploymentsInformer := factory.Apps().V1().Deployments().Informer()
-    stopper := make(chan struct{})
-    defer close(stopper)
-    defer runtime.HandleCrash()
-    deploymentsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-        AddFunc: onAdd,
-    })
-    go deploymentsInformer.Run(stopper)
-    if !cache.WaitForCacheSync(stopper, deploymentsInformer.HasSynced) {
-        runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
-        return
-    }
-    <-stopper
+	factory := informers.NewSharedInformerFactory(kubeClient, 0)
+	deploymentsInformer := factory.Apps().V1().Deployments().Informer()
+	stopper := make(chan struct{})
+	defer close(stopper)
+	defer runtime.HandleCrash()
+	deploymentsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: onAdd,
+	})
+	go deploymentsInformer.Run(stopper)
+	if !cache.WaitForCacheSync(stopper, deploymentsInformer.HasSynced) {
+		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+		return
+	}
+	go applyHPAs(kubeClient, newHPAs)
+	<-stopper
+	close(newHPAs)
+}
+
+func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.HorizontalPodAutoscaler) {
+	fmt.Printf("Waiting for HPAs to apply\n")
+	for hpa := range HPAsToApply {
+		fmt.Printf("Should try and apply an HPA\n%s\n", hpa)
+		namespace := hpa.ObjectMeta.Namespace
+		autoscalingClient := client.AutoscalingV2beta2().HorizontalPodAutoscalers(namespace)
+		result, err := autoscalingClient.Create(&hpa)
+		fmt.Printf("Namespace: %s\n\n%s, %s\n", namespace, result, err)
+	}
+
 }
 
 // onAdd is the function executed when the kubernetes informer notified the
 // presence of a new kubernetes node in the cluster
 func onAdd(obj interface{}) {
-    deployment := obj.(*appsv1.Deployment)
-    fmt.Println("Deployment: " + deployment.ObjectMeta.Name)
-    for k,v := range deployment.Spec.Template.ObjectMeta.Labels {
-        fmt.Printf("Label: ")
-        fmt.Printf("key[%s] value[%s]\n", k, v)
-    }
-    // Cast the obj as node
-    // node := obj.(*corev1.Node)
-    // _, ok := node.GetLabels()["label"]
-    // if ok {
-    //     fmt.Printf("It has the label!")
-    // }
+	deployment := obj.(*appsv1.Deployment)
+	fmt.Println("Deployment: " + deployment.ObjectMeta.Name)
+	for k, v := range deployment.Spec.Template.ObjectMeta.Labels {
+		fmt.Printf("Template Label: ")
+		fmt.Printf("key[%s] value[%s]\n", k, v)
+	}
+	// for k, v := range deployment.ObjectMeta.Annotations {
+	// 	fmt.Printf("Annotation: ")
+	// 	fmt.Printf("key[%s] value[%s]\n", k, v)
+	// }
+
+	demo_status, ok := deployment.ObjectMeta.Annotations["kube-controller-demo"]
+
+	if ok && demo_status == "enable" {
+		fmt.Printf("Should try and create an HPA\n")
+		var utilization = int32(80)
+		var metricSource = autoscalingv2b2.ResourceMetricSource{
+			Name: "CPU",
+			Target: autoscalingv2b2.MetricTarget{
+				Type:               "Utilization",
+				AverageUtilization: &utilization,
+			},
+		}
+
+		metadata := metav1.ObjectMeta{
+			Name: deployment.ObjectMeta.Name,
+			Namespace: deployment.ObjectMeta.Namespace,
+			Labels: deployment.ObjectMeta.Labels,
+		}
+
+		hpa := autoscalingv2b2.HorizontalPodAutoscaler{
+			ObjectMeta: metadata,
+			Spec: autoscalingv2b2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2b2.CrossVersionObjectReference{
+					Kind:       "Deployment",
+					Name:       deployment.ObjectMeta.Name,
+					APIVersion: "apps/v1",
+				},
+				MaxReplicas: 5,
+				Metrics: []autoscalingv2b2.MetricSpec{autoscalingv2b2.MetricSpec{
+					Type:     "Resource",
+					Resource: &metricSource,
+				}},
+			},
+		}
+		newHPAs <- hpa
+
+	}
+
+	// Cast the obj as node
+	// node := obj.(*corev1.Node)
+	// _, ok := node.GetLabels()["label"]
+	// if ok {
+	//     fmt.Printf("It has the label!")
+	// }
+	fmt.Printf("Done with Deployment \n\n")
 }
 
 func init() {

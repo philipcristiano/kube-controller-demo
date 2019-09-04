@@ -37,7 +37,13 @@ var (
 	kubeconfig string
 )
 
+type WatchedHPA struct {
+	name      string
+	namespace string
+}
+
 var newHPAs = make(chan autoscalingv2b2.HorizontalPodAutoscaler)
+var newWatchHPAs = make(chan WatchedHPA)
 
 func main() {
 	klog.InitFlags(nil)
@@ -69,12 +75,13 @@ func main() {
 		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
 		return
 	}
-	go applyHPAs(kubeClient, newHPAs)
+	go applyHPAs(kubeClient, newHPAs, newWatchHPAs)
+	go updateHPAs(kubeClient, newWatchHPAs)
 	<-stopper
 	close(newHPAs)
 }
 
-func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.HorizontalPodAutoscaler) {
+func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.HorizontalPodAutoscaler, HPAsToWatch chan WatchedHPA) {
 	fmt.Printf("Waiting for HPAs to apply\n")
 	for hpa := range HPAsToApply {
 		fmt.Printf("Should try and apply an HPA\n%s\n", hpa)
@@ -83,8 +90,21 @@ func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.Ho
 		autoscalingClient := client.AutoscalingV2beta2().HorizontalPodAutoscalers(namespace)
 		result, err := autoscalingClient.Create(&hpa)
 		fmt.Printf("Namespace: %s\n\n%s, %s\n", namespace, result, err)
-
 		// Test out updating the HPA
+		watchHPA := WatchedHPA{
+			name:      hpaName,
+			namespace: namespace,
+		}
+		HPAsToWatch <- watchHPA
+	}
+	close(HPAsToWatch)
+
+}
+
+func updateHPAs(client *kubernetes.Clientset, HPAsToWatch chan WatchedHPA) {
+	for watchedHPA := range HPAsToWatch {
+		hpaName := watchedHPA.name
+		autoscalingClient := client.AutoscalingV2beta2().HorizontalPodAutoscalers(watchedHPA.namespace)
 		fmt.Printf("Going to try and update the HPA with a higher max!\n")
 		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			result, getErr := autoscalingClient.Get(hpaName, metav1.GetOptions{})
@@ -108,9 +128,7 @@ func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.Ho
 			return nil
 		})
 		fmt.Printf("Update attempt %s\n", retryErr)
-
 	}
-
 }
 
 // onAdd is the function executed when the kubernetes informer notified the

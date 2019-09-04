@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
 )
 
@@ -78,9 +79,36 @@ func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.Ho
 	for hpa := range HPAsToApply {
 		fmt.Printf("Should try and apply an HPA\n%s\n", hpa)
 		namespace := hpa.ObjectMeta.Namespace
+		hpaName := hpa.ObjectMeta.Name
 		autoscalingClient := client.AutoscalingV2beta2().HorizontalPodAutoscalers(namespace)
 		result, err := autoscalingClient.Create(&hpa)
 		fmt.Printf("Namespace: %s\n\n%s, %s\n", namespace, result, err)
+
+		// Test out updating the HPA
+		fmt.Printf("Going to try and update the HPA with a higher max!\n")
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			result, getErr := autoscalingClient.Get(hpaName, metav1.GetOptions{})
+
+			if getErr != nil {
+
+				fmt.Printf("Error retrieving the HPA %s:%s", hpaName, getErr)
+				return getErr
+			}
+
+			fmt.Printf("Retrieved HPA %s\n", result.ObjectMeta.Name)
+			result.Spec.MaxReplicas = 7
+			_, updateErr := autoscalingClient.Update(result)
+			if updateErr != nil {
+
+				fmt.Printf("Error updating the HPA %s:%s", hpaName, updateErr)
+				return updateErr
+			}
+			fmt.Printf("Updated HPA %s\n", hpaName)
+
+			return nil
+		})
+		fmt.Printf("Update attempt %s\n", retryErr)
+
 	}
 
 }
@@ -113,9 +141,9 @@ func onAdd(obj interface{}) {
 		}
 
 		metadata := metav1.ObjectMeta{
-			Name: deployment.ObjectMeta.Name,
+			Name:      deployment.ObjectMeta.Name,
 			Namespace: deployment.ObjectMeta.Namespace,
-			Labels: deployment.ObjectMeta.Labels,
+			Labels:    deployment.ObjectMeta.Labels,
 		}
 
 		hpa := autoscalingv2b2.HorizontalPodAutoscaler{

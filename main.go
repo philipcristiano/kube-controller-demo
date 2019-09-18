@@ -63,41 +63,51 @@ func main() {
 	}
 
 	factory := informers.NewSharedInformerFactory(kubeClient, 0)
-	deploymentsInformer := factory.Apps().V1().Deployments().Informer()
+
 	stopper := make(chan struct{})
 	defer close(stopper)
 	defer runtime.HandleCrash()
+
+	// Deployments informer
+	deploymentsInformer := factory.Apps().V1().Deployments().Informer()
 	deploymentsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: onAdd,
+		AddFunc: onDeploymentsAdd,
 	})
 	go deploymentsInformer.Run(stopper)
 	if !cache.WaitForCacheSync(stopper, deploymentsInformer.HasSynced) {
-		runtime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
+		runtime.HandleError(fmt.Errorf("Timed out waiting for deployment caches to sync"))
 		return
 	}
-	go applyHPAs(kubeClient, newHPAs, newWatchHPAs)
+	// HPAs informer
+	hpasInformer := factory.Autoscaling().V2beta2().HorizontalPodAutoscalers().Informer()
+	hpasInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: onHPAsAdd,
+	})
+	go hpasInformer.Run(stopper)
+	if !cache.WaitForCacheSync(stopper, hpasInformer.HasSynced) {
+		runtime.HandleError(fmt.Errorf("Timed out waiting for hpa caches to sync"))
+		return
+	}
+
+	// Start routines to perform our update logic
+	go applyHPAs(kubeClient, newHPAs)
 	go updateHPAs(kubeClient, newWatchHPAs)
+
 	<-stopper
 	close(newHPAs)
+	close(newWatchHPAs)
 }
 
-func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.HorizontalPodAutoscaler, HPAsToWatch chan WatchedHPA) {
+func applyHPAs(client *kubernetes.Clientset, HPAsToApply chan autoscalingv2b2.HorizontalPodAutoscaler) {
 	fmt.Printf("Waiting for HPAs to apply\n")
 	for hpa := range HPAsToApply {
 		fmt.Printf("Should try and apply an HPA\n%s\n", hpa)
 		namespace := hpa.ObjectMeta.Namespace
-		hpaName := hpa.ObjectMeta.Name
 		autoscalingClient := client.AutoscalingV2beta2().HorizontalPodAutoscalers(namespace)
 		result, err := autoscalingClient.Create(&hpa)
-		fmt.Printf("Namespace: %s\n\n%s, %s\n", namespace, result, err)
+		fmt.Printf("HPA application: Namespace: %s\n\n%s, %s\n", namespace, result, err)
 		// Test out updating the HPA
-		watchHPA := WatchedHPA{
-			name:      hpaName,
-			namespace: namespace,
-		}
-		HPAsToWatch <- watchHPA
 	}
-	close(HPAsToWatch)
 
 }
 
@@ -133,7 +143,7 @@ func updateHPAs(client *kubernetes.Clientset, HPAsToWatch chan WatchedHPA) {
 
 // onAdd is the function executed when the kubernetes informer notified the
 // presence of a new kubernetes node in the cluster
-func onAdd(obj interface{}) {
+func onDeploymentsAdd(obj interface{}) {
 	deployment := obj.(*appsv1.Deployment)
 	fmt.Println("Deployment: " + deployment.ObjectMeta.Name)
 	for k, v := range deployment.Spec.Template.ObjectMeta.Labels {
@@ -158,10 +168,14 @@ func onAdd(obj interface{}) {
 			},
 		}
 
+		annotations := make(map[string]string)
+		annotations["kube-controller-demo"] = "enable"
+
 		metadata := metav1.ObjectMeta{
-			Name:      deployment.ObjectMeta.Name,
-			Namespace: deployment.ObjectMeta.Namespace,
-			Labels:    deployment.ObjectMeta.Labels,
+			Name:        deployment.ObjectMeta.Name,
+			Namespace:   deployment.ObjectMeta.Namespace,
+			Labels:      deployment.ObjectMeta.Labels,
+			Annotations: annotations,
 		}
 
 		hpa := autoscalingv2b2.HorizontalPodAutoscaler{
@@ -190,6 +204,25 @@ func onAdd(obj interface{}) {
 	//     fmt.Printf("It has the label!")
 	// }
 	fmt.Printf("Done with Deployment \n\n")
+}
+
+func onHPAsAdd(obj interface{}) {
+	hpa := obj.(*autoscalingv2b2.HorizontalPodAutoscaler)
+	demo_status, ok := hpa.ObjectMeta.Annotations["kube-controller-demo"]
+
+	fmt.Printf("Informer HPA:%s %s\n", hpa.ObjectMeta.Name, demo_status)
+
+	if ok && demo_status == "enable" {
+		fmt.Printf("Should update HPA:%s %s\n", hpa.ObjectMeta.Name, demo_status)
+		watchHPA := WatchedHPA{
+			name:      hpa.ObjectMeta.Name,
+			namespace: hpa.ObjectMeta.Namespace,
+		}
+		newWatchHPAs <- watchHPA
+	} else {
+		fmt.Printf("Won't update HPA, it's not enabled: %s %s\n", hpa.ObjectMeta.Name, demo_status)
+	}
+
 }
 
 func init() {
